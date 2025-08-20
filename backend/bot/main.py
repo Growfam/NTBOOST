@@ -1,53 +1,172 @@
 # backend/bot/main.py
 """
-Основний файл Telegram бота
+Основний файл Telegram бота - УЛЬТИМАТИВНЕ ВИПРАВЛЕННЯ
 """
 import asyncio
+from typing import Optional
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.redis import RedisStorage
-from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 import structlog
+import threading
 
 from backend.config import get_config
-from backend.bot.handlers import start, packages, orders, admin
 from backend.utils.logger import setup_logging
 from backend.database.connection import init_database
 
 config = get_config()
 logger = structlog.get_logger(__name__)
 
-# Ініціалізація бота
-bot = Bot(token=config.TELEGRAM_BOT_TOKEN, parse_mode="HTML")
-
-# Redis storage для FSM
-storage = RedisStorage.from_url(config.REDIS_URL)
-
-# Диспетчер
-dp = Dispatcher(storage=storage)
+# ВИПРАВЛЕНО: Глобальні змінні з proper cleanup
+_bot_instance: Optional[Bot] = None
+_storage_instance: Optional[RedisStorage] = None
+_dp_instance: Optional[Dispatcher] = None
+_initialization_lock = threading.Lock()  # Використовуємо threading.Lock для sync compatibility
 
 
-async def setup_bot():
-    """Налаштування бота"""
+async def create_redis_storage():
+    """Створює Redis storage для FSM"""
     try:
+        # Імпортуємо Redis для aiogram 3.x
+        from redis.asyncio.client import Redis
+
+        # Додаємо timeout та connection parameters
+        redis = Redis.from_url(
+            config.REDIS_URL,
+            decode_responses=True,
+            retry_on_timeout=True,
+            health_check_interval=30,
+            socket_connect_timeout=5,
+            socket_timeout=5,
+            max_connections=10
+        )
+
+        # Тестуємо підключення з timeout
+        try:
+            await asyncio.wait_for(redis.ping(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.error("Redis ping timeout")
+            raise ConnectionError("Redis connection timeout")
+
+        # Створюємо storage
+        storage = RedisStorage(redis=redis)
+        logger.info("Redis storage created successfully")
+        return storage
+
+    except Exception as e:
+        logger.warning(f"Failed to create Redis storage: {e}")
+        logger.info("Falling back to Memory storage")
+        return MemoryStorage()
+
+
+async def get_bot() -> Bot:
+    """Thread-safe отримання інстансу бота"""
+    global _bot_instance
+
+    if _bot_instance is None:
+        # ВИПРАВЛЕНО: Не можемо використовувати asyncio.Lock в sync контексті
+        with _initialization_lock:
+            if _bot_instance is None:  # Double-check
+                if not config.TELEGRAM_BOT_TOKEN:
+                    raise ValueError("TELEGRAM_BOT_TOKEN is required")
+
+                _bot_instance = Bot(
+                    token=config.TELEGRAM_BOT_TOKEN,
+                    parse_mode="HTML"
+                )
+                logger.info("Bot instance created")
+
+    return _bot_instance
+
+
+async def get_storage():
+    """Thread-safe отримання storage"""
+    global _storage_instance
+
+    if _storage_instance is None:
+        with _initialization_lock:
+            if _storage_instance is None:  # Double-check
+                _storage_instance = await create_redis_storage()
+
+    return _storage_instance
+
+
+async def get_dispatcher() -> Dispatcher:
+    """Thread-safe отримання dispatcher"""
+    global _dp_instance
+
+    if _dp_instance is None:
+        with _initialization_lock:
+            if _dp_instance is None:  # Double-check
+                storage = await get_storage()
+                _dp_instance = Dispatcher(storage=storage)
+                logger.info("Dispatcher created")
+
+    return _dp_instance
+
+
+async def register_handlers():
+    """Реєструє всі handlers"""
+    try:
+        # Отримуємо dispatcher
+        dp = await get_dispatcher()
+
+        # Імпортуємо handlers тут, щоб уникнути циркулярних імпортів
+        from backend.bot.handlers import start, packages, orders, admin
+
         # Реєструємо роутери
         dp.include_router(start.router)
         dp.include_router(packages.router)
         dp.include_router(orders.router)
         dp.include_router(admin.router)
 
+        logger.info("All handlers registered successfully")
+        return True
+
+    except Exception as e:
+        logger.error(f"Failed to register handlers: {e}")
+        return False
+
+
+async def setup_bot():
+    """Налаштування бота"""
+    try:
+        # Ініціалізуємо компоненти
+        bot = await get_bot()
+        dp = await get_dispatcher()
+
+        # Реєструємо handlers
+        if not await register_handlers():
+            return False
+
         # Ініціалізуємо базу даних
         if not await init_database():
             logger.error("Failed to initialize database")
             return False
 
-        # Налаштовуємо webhook
+        # Налаштовуємо webhook якщо потрібно
         webhook_url = config.get_webhook_url()
         if webhook_url:
-            await bot.set_webhook(webhook_url)
-            logger.info(f"Webhook set to {webhook_url}")
+            try:
+                # Видаляємо старий webhook
+                await bot.delete_webhook(drop_pending_updates=True)
+
+                # Встановлюємо новий
+                await bot.set_webhook(
+                    webhook_url,
+                    allowed_updates=["message", "callback_query", "inline_query"],
+                    max_connections=100
+                )
+                logger.info(f"Webhook set to {webhook_url}")
+            except Exception as e:
+                logger.error(f"Failed to set webhook: {e}")
+                return False
         else:
-            logger.warning("No webhook URL configured")
+            # Видаляємо webhook для polling режиму
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook removed, using polling mode")
 
         logger.info("Bot setup completed successfully")
         return True
@@ -58,341 +177,139 @@ async def setup_bot():
 
 
 async def shutdown_bot():
-    """Закриття бота"""
+    """Закриття бота з proper cleanup"""
+    global _bot_instance, _storage_instance, _dp_instance
+
     try:
-        await bot.session.close()
-        await storage.close()
+        shutdown_tasks = []
+
+        if _bot_instance:
+            # Закриваємо сесію бота
+            shutdown_tasks.append(_bot_instance.session.close())
+            logger.info("Bot session scheduled for closure")
+
+        if _storage_instance:
+            # Закриваємо storage
+            shutdown_tasks.append(_storage_instance.close())
+            logger.info("Storage scheduled for closure")
+
+        # Виконуємо всі завдання закриття з timeout
+        if shutdown_tasks:
+            await asyncio.wait_for(
+                asyncio.gather(*shutdown_tasks, return_exceptions=True),
+                timeout=10.0
+            )
+
+        # ВИПРАВЛЕНО: Очищаємо глобальні змінні
+        with _initialization_lock:
+            _bot_instance = None
+            _storage_instance = None
+            _dp_instance = None
+
         logger.info("Bot shutdown completed")
+
+    except asyncio.TimeoutError:
+        logger.warning("Bot shutdown timeout, forcing cleanup")
+        # Форсуємо очищення
+        with _initialization_lock:
+            _bot_instance = None
+            _storage_instance = None
+            _dp_instance = None
     except Exception as e:
         logger.error(f"Error during bot shutdown: {e}")
 
 
-def create_webhook_app():
+async def create_webhook_app():
     """Створює aiohttp додаток для webhook"""
-    app = web.Application()
+    try:
+        bot = await get_bot()
+        dp = await get_dispatcher()
 
-    # Налаштовуємо webhook handler
-    webhook_requests_handler = SimpleRequestHandler(
-        dispatcher=dp,
-        bot=bot,
-    )
-    webhook_requests_handler.register(app, path=config.WEBHOOK_PATH)
+        app = web.Application()
 
-    return app
+        # Налаштовуємо webhook handler
+        webhook_requests_handler = SimpleRequestHandler(
+            dispatcher=dp,
+            bot=bot,
+        )
+        webhook_requests_handler.register(app, path=config.WEBHOOK_PATH)
 
+        # Додаємо middleware для логування
+        async def logging_middleware(request, handler):
+            start_time = asyncio.get_event_loop().time()
 
-# ===================================
-
-# backend/app.py
-"""
-Flask додаток для API та webhook
-"""
-from flask import Flask, request, jsonify
-import asyncio
-import structlog
-from typing import Dict, Any
-
-from backend.config import get_config
-from backend.services.payment_service import PaymentService
-from backend.services.external_service import ExternalService
-from backend.bot.handlers.admin import notify_admins_payment_success
-from backend.utils.logger import setup_logging
-
-config = get_config()
-logger = structlog.get_logger(__name__)
-
-
-def create_app():
-    """Створює Flask додаток"""
-    app = Flask(__name__)
-    app.config.from_object(config)
-
-    # Налаштовуємо логування
-    setup_logging()
-
-    @app.route('/health', methods=['GET'])
-    def health_check():
-        """Health check endpoint"""
-        try:
-            from backend.database.connection import db
-            db_healthy = db.health_check()
-
-            return jsonify({
-                'status': 'healthy' if db_healthy else 'unhealthy',
-                'database': 'connected' if db_healthy else 'disconnected',
-                'service': 'interface-bot'
-            }), 200 if db_healthy else 503
-
-        except Exception as e:
-            logger.error("Health check failed", error=str(e))
-            return jsonify({
-                'status': 'unhealthy',
-                'error': str(e)
-            }), 503
-
-    @app.route(config.CRYPTOBOT_WEBHOOK_PATH, methods=['POST'])
-    def cryptobot_webhook():
-        """Webhook для CryptoBot платежів"""
-        try:
-            # Отримуємо дані
-            webhook_data = request.get_json()
-
-            if not webhook_data:
-                logger.warning("Empty webhook data received")
-                return jsonify({'error': 'No data'}), 400
-
-            # Перевіряємо підпис (якщо налаштований)
-            signature = request.headers.get('Crypto-Pay-API-Signature')
-            if config.CRYPTOBOT_WEBHOOK_SECRET and signature:
-                body = request.get_data()
-                is_valid = asyncio.run(
-                    PaymentService.verify_webhook(body, signature)
+            try:
+                response = await handler(request)
+                process_time = asyncio.get_event_loop().time() - start_time
+                logger.info(
+                    "Webhook request processed",
+                    method=request.method,
+                    path=request.path,
+                    status=response.status,
+                    process_time=round(process_time, 3)
                 )
-                if not is_valid:
-                    logger.warning("Invalid webhook signature")
-                    return jsonify({'error': 'Invalid signature'}), 401
+                return response
+            except Exception as e:
+                process_time = asyncio.get_event_loop().time() - start_time
+                logger.error(
+                    "Webhook request failed",
+                    method=request.method,
+                    path=request.path,
+                    error=str(e),
+                    process_time=round(process_time, 3)
+                )
+                raise
 
-            # Обробляємо платіж
-            success = asyncio.run(
-                PaymentService.process_payment_webhook(webhook_data)
-            )
+        app.middlewares.append(logging_middleware)
 
-            if success:
-                logger.info("Payment webhook processed successfully")
-                return jsonify({'status': 'ok'}), 200
-            else:
-                logger.error("Failed to process payment webhook")
-                return jsonify({'error': 'Processing failed'}), 400
+        # Додаємо health check для webhook app
+        async def webhook_health(request):
+            return web.json_response({
+                'status': 'healthy',
+                'service': 'telegram-webhook'
+            })
 
-        except Exception as e:
-            logger.error("Error processing CryptoBot webhook", error=str(e))
-            return jsonify({'error': 'Internal error'}), 500
+        app.router.add_get('/webhook/health', webhook_health)
 
-    @app.route('/api/tasks/pending', methods=['GET'])
-    def get_pending_tasks():
-        """API для отримання завдань основним ботом"""
-        try:
-            # Перевіряємо API ключ
-            api_key = request.headers.get('Authorization', '').replace('Bearer ', '')
-            if api_key != config.MAIN_BOT_API_KEY:
-                return jsonify({'error': 'Unauthorized'}), 401
-
-            limit = request.args.get('limit', 10, type=int)
-
-            # Отримуємо завдання
-            tasks = asyncio.run(ExternalService.send_pending_tasks(limit))
-
-            return jsonify({
-                'success': True,
-                'tasks_sent': tasks
-            }), 200
-
-        except Exception as e:
-            logger.error("Error getting pending tasks", error=str(e))
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/tasks/<task_id>/status', methods=['PUT'])
-    def update_task_status(task_id: str):
-        """API для оновлення статусу завдання основним ботом"""
-        try:
-            # Перевіряємо API ключ
-            api_key = request.headers.get('Authorization', '').replace('Bearer ', '')
-            if api_key != config.MAIN_BOT_API_KEY:
-                return jsonify({'error': 'Unauthorized'}), 401
-
-            data = request.get_json()
-            if not data:
-                return jsonify({'error': 'No data provided'}), 400
-
-            status = data.get('status')
-            external_task_id = data.get('external_task_id')
-            response_data = data.get('response_data')
-
-            if not status:
-                return jsonify({'error': 'Status is required'}), 400
-
-            # Оновлюємо статус
-            from backend.database.connection import update_task_status
-            success = update_task_status(task_id, status, external_task_id, response_data)
-
-            if success:
-                return jsonify({'success': True}), 200
-            else:
-                return jsonify({'error': 'Failed to update status'}), 400
-
-        except Exception as e:
-            logger.error(f"Error updating task status for {task_id}", error=str(e))
-            return jsonify({'error': str(e)}), 500
-
-    @app.route('/api/stats/admin', methods=['GET'])
-    def get_admin_stats_api():
-        """API для отримання адмін статистики"""
-        try:
-            # Перевіряємо API ключ або адмін права
-            api_key = request.headers.get('Authorization', '').replace('Bearer ', '')
-            if api_key != config.MAIN_BOT_API_KEY:
-                return jsonify({'error': 'Unauthorized'}), 401
-
-            from backend.database.connection import get_admin_stats
-            stats = get_admin_stats()
-
-            return jsonify(stats), 200
-
-        except Exception as e:
-            logger.error("Error getting admin stats via API", error=str(e))
-            return jsonify({'error': str(e)}), 500
-
-    @app.errorhandler(404)
-    def not_found(error):
-        return jsonify({'error': 'Endpoint not found'}), 404
-
-    @app.errorhandler(500)
-    def internal_error(error):
-        logger.error("Internal server error", error=str(error))
-        return jsonify({'error': 'Internal server error'}), 500
-
-    return app
-
-
-# ===================================
-
-# backend/api/webhooks.py
-"""
-Додаткові webhook обробники
-"""
-from flask import Blueprint, request, jsonify
-import structlog
-
-from backend.services.payment_service import PaymentService
-from backend.config import get_config
-
-config = get_config()
-logger = structlog.get_logger(__name__)
-
-webhooks_bp = Blueprint('webhooks', __name__, url_prefix='/webhook')
-
-
-@webhooks_bp.route('/test', methods=['GET', 'POST'])
-def webhook_test():
-    """Тестовий endpoint для перевірки webhook"""
-    try:
-        method = request.method
-        data = request.get_json() if method == 'POST' else request.args.to_dict()
-
-        logger.info(f"Webhook test called via {method}", data=data)
-
-        return jsonify({
-            'status': 'ok',
-            'method': method,
-            'data_received': data,
-            'message': 'Webhook is working'
-        }), 200
+        logger.info("Webhook app created successfully")
+        return app
 
     except Exception as e:
-        logger.error("Error in webhook test", error=str(e))
-        return jsonify({'error': str(e)}), 500
+        logger.error(f"Error creating webhook app: {e}")
+        return None
 
 
-@webhooks_bp.route('/cryptobot/test', methods=['POST'])
-def cryptobot_test():
-    """Тестовий endpoint для CryptoBot webhook"""
-    try:
-        data = request.get_json()
-
-        logger.info("CryptoBot test webhook received", data=data)
-
-        # Імітуємо обробку
-        return jsonify({
-            'status': 'received',
-            'update_type': data.get('update_type', 'unknown'),
-            'message': 'Test webhook processed'
-        }), 200
-
-    except Exception as e:
-        logger.error("Error in CryptoBot test webhook", error=str(e))
-        return jsonify({'error': str(e)}), 500
+# ВИПРАВЛЕНО: Функції для перевірки статусу
+def is_bot_initialized() -> bool:
+    """Перевіряє чи ініціалізований бот"""
+    return _bot_instance is not None
 
 
-# ===================================
-
-# backend/api/health.py
-"""
-Health check endpoints
-"""
-from flask import Blueprint, jsonify
-import structlog
-
-from backend.database.connection import db
-from backend.services.external_service import ExternalService
-
-logger = structlog.get_logger(__name__)
-
-health_bp = Blueprint('health', __name__, url_prefix='/health')
+def is_dispatcher_initialized() -> bool:
+    """Перевіряє чи ініціалізований dispatcher"""
+    return _dp_instance is not None
 
 
-@health_bp.route('/', methods=['GET'])
-def health_check():
-    """Основний health check"""
-    try:
-        checks = {
-            'database': db.health_check(),
-            'redis': _check_redis(),
-            'main_bot': False  # Буде перевірено асинхронно
-        }
-
-        # Асинхронна перевірка основного бота
-        import asyncio
-        try:
-            checks['main_bot'] = asyncio.run(ExternalService.check_main_bot_health())
-        except:
-            checks['main_bot'] = False
-
-        all_healthy = all(checks.values())
-
-        return jsonify({
-            'status': 'healthy' if all_healthy else 'degraded',
-            'checks': checks,
-            'service': 'socialboost-interface-bot'
-        }), 200 if all_healthy else 503
-
-    except Exception as e:
-        logger.error("Health check failed", error=str(e))
-        return jsonify({
-            'status': 'unhealthy',
-            'error': str(e)
-        }), 503
+# ВИПРАВЛЕНО: Видаляємо properties, замінюємо на звичайні функції
+def get_bot_sync() -> Optional[Bot]:
+    """Синхронний getter для bot instance"""
+    return _bot_instance
 
 
-@health_bp.route('/database', methods=['GET'])
-def database_health():
-    """Перевірка бази даних"""
-    try:
-        healthy = db.health_check()
-        return jsonify({
-            'database': 'healthy' if healthy else 'unhealthy'
-        }), 200 if healthy else 503
-    except Exception as e:
-        return jsonify({'error': str(e)}), 503
+def get_dp_sync() -> Optional[Dispatcher]:
+    """Синхронний getter для dispatcher instance"""
+    return _dp_instance
 
 
-@health_bp.route('/redis', methods=['GET'])
-def redis_health():
-    """Перевірка Redis"""
-    try:
-        healthy = _check_redis()
-        return jsonify({
-            'redis': 'healthy' if healthy else 'unhealthy'
-        }), 200 if healthy else 503
-    except Exception as e:
-        return jsonify({'error': str(e)}), 503
+def get_storage_sync() -> Optional[RedisStorage]:
+    """Синхронний getter для storage instance"""
+    return _storage_instance
 
 
-def _check_redis() -> bool:
-    """Перевірка підключення до Redis"""
-    try:
-        from backend.utils.cache import cache
-        cache.set('health_check', 'ok', 10)
-        result = cache.get('health_check')
-        return result == 'ok'
-    except:
-        return False
+# Експортуємо для використання в main.py
+__all__ = [
+    'get_bot', 'get_dispatcher', 'get_storage',
+    'setup_bot', 'shutdown_bot', 'create_webhook_app',
+    'is_bot_initialized', 'is_dispatcher_initialized',
+    'get_bot_sync', 'get_dp_sync', 'get_storage_sync'  # ВИПРАВЛЕНО: замість properties
+]

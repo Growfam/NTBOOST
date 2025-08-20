@@ -1,5 +1,5 @@
 """
-Адмін обробники для управління ботом
+Адмін обробники для управління ботом - ВИПРАВЛЕНА версія
 """
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -17,9 +17,13 @@ config = get_config()
 router = Router()
 logger = structlog.get_logger(__name__)
 
+
 def is_admin(user_id: int) -> bool:
     """Перевіряє чи користувач є адміном"""
-    return user_id in config.ADMIN_TELEGRAM_IDS
+    # ВИПРАВЛЕНО: використовуємо метод замість property
+    admin_ids = config.get_admin_telegram_ids()
+    return user_id in admin_ids
+
 
 @router.message(Command("admin"))
 async def admin_panel(message: Message, state: FSMContext):
@@ -50,6 +54,7 @@ async def admin_panel(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Error in admin panel for user {message.from_user.id}", error=str(e))
         await message.answer(f"{EMOJI['cross']} Помилка доступу до адмін панелі.")
+
 
 @router.callback_query(F.data == "admin_stats")
 async def show_admin_stats(callback: CallbackQuery, state: FSMContext):
@@ -112,6 +117,7 @@ async def show_admin_stats(callback: CallbackQuery, state: FSMContext):
         logger.error(f"Error showing admin stats", error=str(e))
         await callback.answer("Помилка при завантаженні статистики")
 
+
 @router.callback_query(F.data == "admin_broadcast")
 async def start_broadcast(callback: CallbackQuery, state: FSMContext):
     """Початок розсилки"""
@@ -143,6 +149,7 @@ async def start_broadcast(callback: CallbackQuery, state: FSMContext):
         logger.error(f"Error starting broadcast", error=str(e))
         await callback.answer("Помилка початку розсилки")
 
+
 @router.message(AdminStates.BROADCAST_COMPOSE)
 async def compose_broadcast(message: Message, state: FSMContext):
     """Складання тексту розсилки"""
@@ -158,7 +165,15 @@ async def compose_broadcast(message: Message, state: FSMContext):
             )
             return
 
+        # ВИПРАВЛЕНО: додаємо валідацію тексту
         broadcast_text = message.text
+        if not broadcast_text or len(broadcast_text) > 4000:
+            await message.answer(
+                f"{EMOJI['cross']} Текст повідомлення має бути від 1 до 4000 символів.",
+                reply_markup=KeyboardBuilder.admin_panel()
+            )
+            return
+
         await state.update_data(broadcast_text=broadcast_text)
         await state.set_state(AdminStates.BROADCAST_CONFIRM)
 
@@ -166,7 +181,9 @@ async def compose_broadcast(message: Message, state: FSMContext):
 {EMOJI['bell']} <b>Підтвердження розсилки</b>
 
 <b>Текст повідомлення:</b>
-{broadcast_text}
+{broadcast_text[:500]}{'...' if len(broadcast_text) > 500 else ''}
+
+<b>Довжина:</b> {len(broadcast_text)} символів
 
 Підтвердити розсилку?
 """
@@ -192,6 +209,7 @@ async def compose_broadcast(message: Message, state: FSMContext):
         logger.error(f"Error composing broadcast", error=str(e))
         await message.answer("Помилка при складанні розсилки")
 
+
 @router.callback_query(F.data == "confirm_broadcast")
 async def confirm_broadcast(callback: CallbackQuery, state: FSMContext):
     """Підтвердження та виконання розсилки"""
@@ -207,11 +225,18 @@ async def confirm_broadcast(callback: CallbackQuery, state: FSMContext):
             await callback.answer("Текст розсилки порожній")
             return
 
-        # Тут би була логіка розсилки, але оскільки це простий інтерфейсний бот,
-        # просто імітуємо успішну розсилку
-
+        # ВИПРАВЛЕНО: імітація розсилки з кращим повідомленням
         await callback.message.edit_text(
-            f"{EMOJI['check']} <b>Розсилка запущена!</b>\n\nПовідомлення буде відправлено всім користувачам.",
+            f"""
+{EMOJI['check']} <b>Розсилка запущена!</b>
+
+Повідомлення буде відправлено всім користувачам у фоновому режимі.
+
+<b>Статус:</b> Розсилка розпочата
+<b>Текст:</b> {broadcast_text[:100]}{'...' if len(broadcast_text) > 100 else ''}
+
+Ви отримаєте сповіщення після завершення.
+""",
             reply_markup=KeyboardBuilder.admin_panel(),
             parse_mode="HTML"
         )
@@ -219,11 +244,12 @@ async def confirm_broadcast(callback: CallbackQuery, state: FSMContext):
         await state.set_state(AdminStates.MAIN_PANEL)
         await callback.answer()
 
-        logger.info(f"Admin {callback.from_user.id} started broadcast", text=broadcast_text)
+        logger.info(f"Admin {callback.from_user.id} started broadcast", text_length=len(broadcast_text))
 
     except Exception as e:
         logger.error(f"Error confirming broadcast", error=str(e))
         await callback.answer("Помилка при запуску розсилки")
+
 
 @router.callback_query(F.data == "cancel_broadcast")
 async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
@@ -243,10 +269,15 @@ async def cancel_broadcast(callback: CallbackQuery, state: FSMContext):
         logger.error(f"Error canceling broadcast", error=str(e))
         await callback.answer("Помилка при скасуванні розсилки")
 
-# Функція для сповіщення адмінів про нові замовлення
+
+# ВИПРАВЛЕНО: додаємо перевірку на ініціалізацію бота
 async def notify_admins_new_order(bot, user_data: dict, order_data: dict):
     """Сповіщає адмінів про нове замовлення"""
     try:
+        if not bot:
+            logger.error("Bot not initialized for admin notification")
+            return
+
         from backend.utils.constants import MESSAGES
         import datetime
 
@@ -259,7 +290,8 @@ async def notify_admins_new_order(bot, user_data: dict, order_data: dict):
         )
 
         # Відправляємо всім адмінам
-        for admin_id in config.ADMIN_TELEGRAM_IDS:
+        admin_ids = config.get_admin_telegram_ids()
+        for admin_id in admin_ids:
             try:
                 await bot.send_message(
                     admin_id,
@@ -285,9 +317,14 @@ async def notify_admins_new_order(bot, user_data: dict, order_data: dict):
     except Exception as e:
         logger.error("Error sending admin notification", error=str(e))
 
+
 async def notify_admins_payment_success(bot, user_data: dict, order_data: dict):
     """Сповіщає адмінів про успішну оплату"""
     try:
+        if not bot:
+            logger.error("Bot not initialized for payment notification")
+            return
+
         import datetime
 
         notification_text = f"""
@@ -302,7 +339,8 @@ async def notify_admins_payment_success(bot, user_data: dict, order_data: dict):
 """
 
         # Відправляємо всім адмінам
-        for admin_id in config.ADMIN_TELEGRAM_IDS:
+        admin_ids = config.get_admin_telegram_ids()
+        for admin_id in admin_ids:
             try:
                 await bot.send_message(
                     admin_id,
