@@ -37,39 +37,54 @@ async def create_redis_storage():
     try:
         logger.info("Creating storage...")
 
-        # В production на Railway використовуємо MemoryStorage якщо Redis недоступний
-        if "localhost" in config.REDIS_URL and config.is_production():
-            logger.info("Using MemoryStorage for production (Redis localhost detected)")
+        # Перевіряємо чи є Redis URL
+        if not config.REDIS_URL or config.REDIS_URL == "redis://localhost:6379":
+            logger.warning("No valid Redis URL, using MemoryStorage")
             return MemoryStorage()
 
-        # Спробуємо підключитись до Redis
+        logger.info(f"Redis URL found: {config.REDIS_URL[:40]}...")
+
+        # ВАЖЛИВО: Для aiogram потрібен окремий спосіб підключення
         try:
+            # Спробуємо створити RedisStorage з таймаутом
+            logger.info("Attempting RedisStorage creation...")
+
+            # Для Railway можливо потрібно використати MemoryStorage поки що
+            # через несумісність версій redis-py та aiogram
+            if "railway.internal" in config.REDIS_URL:
+                logger.info("Railway Redis detected, using MemoryStorage for now")
+                return MemoryStorage()
+
             from redis.asyncio.client import Redis
 
-            logger.info(f"Trying Redis connection to: {config.REDIS_URL}")
-            redis = Redis.from_url(
+            redis_client = Redis.from_url(
                 config.REDIS_URL,
                 decode_responses=True,
                 retry_on_timeout=True,
-                health_check_interval=30,
                 socket_connect_timeout=2,
-                socket_timeout=2,
-                max_connections=10
+                socket_timeout=2
             )
 
-            # Швидкий тест
-            await asyncio.wait_for(redis.ping(), timeout=1.0)
-            logger.info("Redis connected successfully")
+            # Тест підключення
+            try:
+                await asyncio.wait_for(redis_client.ping(), timeout=2.0)
+                logger.info("Redis ping successful")
+            except asyncio.TimeoutError:
+                logger.warning("Redis ping timeout, using MemoryStorage")
+                await redis_client.close()
+                return MemoryStorage()
 
-            storage = RedisStorage(redis=redis)
+            storage = RedisStorage(redis=redis_client)
+            logger.info("✓ RedisStorage created successfully")
             return storage
 
-        except (ImportError, ConnectionError, asyncio.TimeoutError) as e:
-            logger.warning(f"Redis not available: {e}, using MemoryStorage")
+        except Exception as e:
+            logger.warning(f"RedisStorage creation failed: {e}")
+            logger.info("Falling back to MemoryStorage")
             return MemoryStorage()
 
     except Exception as e:
-        logger.error(f"Storage creation error: {e}, using MemoryStorage")
+        logger.error(f"Storage error: {e}")
         return MemoryStorage()
 
 
@@ -103,8 +118,22 @@ async def get_storage():
     if _storage_instance is None:
         with _initialization_lock:
             if _storage_instance is None:
-                _storage_instance = await create_redis_storage()
-                logger.info(f"Storage created: {type(_storage_instance).__name__}")
+                logger.info("Creating new storage instance...")
+                try:
+                    # Створюємо storage з таймаутом
+                    _storage_instance = await asyncio.wait_for(
+                        create_redis_storage(),
+                        timeout=5.0
+                    )
+                    logger.info(f"✓ Storage created: {type(_storage_instance).__name__}")
+                except asyncio.TimeoutError:
+                    logger.error("Storage creation timeout, using MemoryStorage")
+                    _storage_instance = MemoryStorage()
+                except Exception as e:
+                    logger.error(f"Storage creation failed: {e}, using MemoryStorage")
+                    _storage_instance = MemoryStorage()
+
+    return _storage_instance
 
     return _storage_instance
 
@@ -116,9 +145,19 @@ async def get_dispatcher() -> Dispatcher:
     if _dp_instance is None:
         with _initialization_lock:
             if _dp_instance is None:
-                storage = await get_storage()
-                _dp_instance = Dispatcher(storage=storage)
-                logger.info("Dispatcher created")
+                logger.info("Creating new dispatcher instance...")
+                try:
+                    storage = await get_storage()
+                    logger.info(f"Got storage for dispatcher: {type(storage).__name__}")
+
+                    _dp_instance = Dispatcher(storage=storage)
+                    logger.info("✓ Dispatcher created successfully")
+                except Exception as e:
+                    logger.error(f"Dispatcher creation error: {e}")
+                    # Спробуємо з MemoryStorage
+                    logger.info("Retrying with MemoryStorage...")
+                    _dp_instance = Dispatcher(storage=MemoryStorage())
+                    logger.info("✓ Dispatcher created with MemoryStorage")
 
     return _dp_instance
 
@@ -219,8 +258,15 @@ async def setup_bot():
         # 3. Create dispatcher
         try:
             logger.info("Creating dispatcher...")
-            dp = await get_dispatcher()
+            dp = await asyncio.wait_for(get_dispatcher(), timeout=10.0)
             logger.info("✓ Dispatcher created")
+        except asyncio.TimeoutError:
+            logger.error("✗ Dispatcher creation timeout")
+            # Спробуємо створити напряму з MemoryStorage
+            logger.info("Creating dispatcher with MemoryStorage directly...")
+            _dp_instance = Dispatcher(storage=MemoryStorage())
+            dp = _dp_instance
+            logger.info("✓ Dispatcher created with MemoryStorage fallback")
         except Exception as e:
             logger.error(f"✗ Dispatcher creation failed: {e}")
             return False
