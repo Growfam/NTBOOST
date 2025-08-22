@@ -1,5 +1,5 @@
 """
-Flask додаток для API та webhook - ФІНАЛЬНА виправлена версія
+Flask додаток для API та webhook - FIXED FOR PRODUCTION
 """
 from flask import Flask, request, jsonify
 import asyncio
@@ -17,28 +17,12 @@ from backend.utils.logger import setup_logging
 config = get_config()
 logger = structlog.get_logger(__name__)
 
-# ВИПРАВЛЕНО: Thread pool з proper cleanup
-thread_pool = None
+# ВИПРАВЛЕНО: Thread pool ініціалізується при імпорті
+thread_pool = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix='async_handler'
+)
 thread_pool_lock = threading.Lock()
-
-
-def get_thread_pool():
-    """Thread-safe отримання thread pool"""
-    global thread_pool
-
-    if thread_pool is None:
-        with thread_pool_lock:
-            if thread_pool is None:
-                thread_pool = ThreadPoolExecutor(
-                    max_workers=4,
-                    thread_name_prefix='async_handler'
-                )
-                # Реєструємо cleanup при виході
-                atexit.register(cleanup_thread_pool)
-                logger.info("Thread pool created")
-
-    return thread_pool
-
 
 def cleanup_thread_pool():
     """Очищення thread pool"""
@@ -46,13 +30,17 @@ def cleanup_thread_pool():
 
     if thread_pool:
         logger.info("Shutting down thread pool...")
-        thread_pool.shutdown(wait=True, timeout=5.0)
-        thread_pool = None
+        try:
+            thread_pool.shutdown(wait=True, timeout=5.0)
+        except:
+            pass
         logger.info("Thread pool shutdown completed")
 
+# Реєструємо cleanup при виході
+atexit.register(cleanup_thread_pool)
 
 def run_async_in_thread(coro, timeout=25):
-    """ВИПРАВЛЕНО: Виконує async функцію з proper error handling"""
+    """Виконує async функцію з proper error handling"""
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -76,10 +64,14 @@ def run_async_in_thread(coro, timeout=25):
             finally:
                 loop.close()
 
-    pool = get_thread_pool()
+    global thread_pool
+
+    if not thread_pool or thread_pool._shutdown:
+        logger.error("Thread pool is not available")
+        raise RuntimeError("Thread pool is not available")
 
     try:
-        future = pool.submit(run)
+        future = thread_pool.submit(run)
         return future.result(timeout=timeout)
     except FutureTimeoutError:
         logger.error(f"Async operation timeout after {timeout}s")
@@ -96,6 +88,10 @@ def create_app():
 
     # Налаштовуємо логування
     setup_logging()
+
+    # Log app creation
+    logger.info("Creating Flask app...")
+    logger.info(f"Thread pool initialized: {thread_pool is not None}")
 
     @app.route('/health', methods=['GET'])
     def health_check():
@@ -143,7 +139,6 @@ def create_app():
                 signature = request.headers.get('Crypto-Pay-API-Signature')
                 if config.CRYPTOBOT_WEBHOOK_SECRET and signature:
                     body = request.get_data()
-                    # ВИПРАВЛЕНО: додаємо try-catch для async операції
                     try:
                         is_valid = run_async_in_thread(
                             PaymentService.verify_webhook(body, signature),
@@ -156,7 +151,7 @@ def create_app():
                         logger.error("Webhook signature verification timeout")
                         return jsonify({'error': 'Verification timeout'}), 408
 
-                # ВИПРАВЛЕНО: додаємо try-catch для async операції
+                # Обробляємо платіж
                 try:
                     success = run_async_in_thread(
                         PaymentService.process_payment_webhook(webhook_data),
@@ -190,7 +185,6 @@ def create_app():
             limit = request.args.get('limit', 10, type=int)
             limit = min(max(limit, 1), 50)  # Обмежуємо від 1 до 50
 
-            # ВИПРАВЛЕНО: додаємо try-catch для async операції
             try:
                 tasks = run_async_in_thread(
                     ExternalService.send_pending_tasks(limit),
@@ -334,10 +328,11 @@ def create_app():
         )
         return response
 
-    # ВИПРАВЛЕНО: додаємо cleanup при завершенні Flask app
+    # Додаємо cleanup при завершенні Flask app
     @app.teardown_appcontext
     def cleanup_app_context(error):
         if error:
             logger.error(f"App context error: {error}")
 
+    logger.info(f"Flask app created successfully, thread pool active: {thread_pool is not None}")
     return app
