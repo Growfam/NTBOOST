@@ -118,6 +118,15 @@ class Config:
             return None
         return f"{cls.TELEGRAM_WEBHOOK_URL.rstrip('/')}{cls.CRYPTOBOT_WEBHOOK_PATH}"
 
+    @classmethod
+    def is_production(cls) -> bool:
+        """Check if running in production mode"""
+        return (
+            os.getenv('RAILWAY_ENVIRONMENT') == 'production' or
+            os.getenv('PRODUCTION', '').lower() == 'true' or
+            os.getenv('FLASK_ENV') == 'production'
+        )
+
 
 class DevelopmentConfig(Config):
     """Конфігурація для розробки"""

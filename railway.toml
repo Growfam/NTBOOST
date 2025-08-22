@@ -2,6 +2,13 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python main.py"
+startCommand = "gunicorn main:app --config gunicorn_config.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+
+[environment]
+PRODUCTION = "true"
+PYTHONUNBUFFERED = "1"
+WEB_CONCURRENCY = "2"
