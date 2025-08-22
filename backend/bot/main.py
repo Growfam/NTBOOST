@@ -1,6 +1,5 @@
-# backend/bot/main.py
 """
-Основний файл Telegram бота - УЛЬТИМАТИВНЕ ВИПРАВЛЕННЯ
+Основний файл Telegram бота - ДЕТАЛЬНЕ ЛОГУВАННЯ
 """
 import asyncio
 from typing import Optional
@@ -11,10 +10,10 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiohttp import web
 import structlog
 import threading
+import traceback
 
 from backend.config import get_config
 from backend.utils.logger import setup_logging
-from backend.database.connection import init_database
 
 config = get_config()
 logger = structlog.get_logger(__name__)
@@ -29,6 +28,9 @@ _initialization_lock = threading.Lock()  # Використовуємо threadin
 async def create_redis_storage():
     """Створює Redis storage для FSM"""
     try:
+        logger.info("Attempting to create Redis storage...")
+        logger.info(f"Redis URL: {config.REDIS_URL}")
+
         # Імпортуємо Redis для aiogram 3.x
         from redis.asyncio.client import Redis
 
@@ -46,6 +48,7 @@ async def create_redis_storage():
         # Тестуємо підключення з timeout
         try:
             await asyncio.wait_for(redis.ping(), timeout=5.0)
+            logger.info("Redis ping successful")
         except asyncio.TimeoutError:
             logger.error("Redis ping timeout")
             raise ConnectionError("Redis connection timeout")
@@ -66,17 +69,17 @@ async def get_bot() -> Bot:
     global _bot_instance
 
     if _bot_instance is None:
-        # ВИПРАВЛЕНО: Не можемо використовувати asyncio.Lock в sync контексті
         with _initialization_lock:
             if _bot_instance is None:  # Double-check
                 if not config.TELEGRAM_BOT_TOKEN:
                     raise ValueError("TELEGRAM_BOT_TOKEN is required")
 
+                logger.info(f"Creating bot instance with token: {config.TELEGRAM_BOT_TOKEN[:20]}...")
                 _bot_instance = Bot(
                     token=config.TELEGRAM_BOT_TOKEN,
                     parse_mode="HTML"
                 )
-                logger.info("Bot instance created")
+                logger.info("Bot instance created successfully")
 
     return _bot_instance
 
@@ -88,7 +91,9 @@ async def get_storage():
     if _storage_instance is None:
         with _initialization_lock:
             if _storage_instance is None:  # Double-check
+                logger.info("Creating storage...")
                 _storage_instance = await create_redis_storage()
+                logger.info("Storage created")
 
     return _storage_instance
 
@@ -100,9 +105,10 @@ async def get_dispatcher() -> Dispatcher:
     if _dp_instance is None:
         with _initialization_lock:
             if _dp_instance is None:  # Double-check
+                logger.info("Creating dispatcher...")
                 storage = await get_storage()
                 _dp_instance = Dispatcher(storage=storage)
-                logger.info("Dispatcher created")
+                logger.info("Dispatcher created successfully")
 
     return _dp_instance
 
@@ -110,45 +116,101 @@ async def get_dispatcher() -> Dispatcher:
 async def register_handlers():
     """Реєструє всі handlers"""
     try:
+        logger.info("Starting handler registration...")
+
         # Отримуємо dispatcher
         dp = await get_dispatcher()
 
         # Імпортуємо handlers тут, щоб уникнути циркулярних імпортів
-        from backend.bot.handlers import start, packages, orders, admin
+        logger.info("Importing handler modules...")
+        try:
+            from backend.bot.handlers import start, packages, orders, admin
+            logger.info("Handler modules imported")
+        except Exception as e:
+            logger.error(f"Failed to import handlers: {e}")
+            logger.error(traceback.format_exc())
+            return False
 
         # Реєструємо роутери
+        logger.info("Including routers...")
         dp.include_router(start.router)
+        logger.info("Start router included")
         dp.include_router(packages.router)
+        logger.info("Packages router included")
         dp.include_router(orders.router)
+        logger.info("Orders router included")
         dp.include_router(admin.router)
+        logger.info("Admin router included")
 
         logger.info("All handlers registered successfully")
         return True
 
     except Exception as e:
         logger.error(f"Failed to register handlers: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+
+async def init_database():
+    """Ініціалізація з'єднання з БД"""
+    try:
+        logger.info("Initializing database connection...")
+
+        from backend.database.connection import db
+
+        # Перевіряємо підключення
+        if db.health_check():
+            logger.info("Database connection successful")
+            return True
+        else:
+            logger.error("Database health check failed")
+            return False
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        logger.error(traceback.format_exc())
         return False
 
 
 async def setup_bot():
     """Налаштування бота"""
     try:
-        # Ініціалізуємо компоненти
-        bot = await get_bot()
-        dp = await get_dispatcher()
+        logger.info("=" * 50)
+        logger.info("setup_bot() started")
 
-        # Реєструємо handlers
-        if not await register_handlers():
+        # Check token first
+        if not config.TELEGRAM_BOT_TOKEN:
+            logger.error("TELEGRAM_BOT_TOKEN is missing!")
             return False
 
+        logger.info(f"Token present: {config.TELEGRAM_BOT_TOKEN[:20]}...")
+
+        # Ініціалізуємо компоненти
+        logger.info("Getting bot instance...")
+        bot = await get_bot()
+        logger.info("Bot instance created")
+
+        logger.info("Getting dispatcher...")
+        dp = await get_dispatcher()
+        logger.info("Dispatcher created")
+
+        # Реєструємо handlers
+        logger.info("Registering handlers...")
+        if not await register_handlers():
+            logger.error("Failed to register handlers")
+            return False
+        logger.info("Handlers registered")
+
         # Ініціалізуємо базу даних
+        logger.info("Initializing database...")
         if not await init_database():
             logger.error("Failed to initialize database")
             return False
+        logger.info("Database initialized")
 
         # Налаштовуємо webhook якщо потрібно
         webhook_url = config.get_webhook_url()
         if webhook_url:
+            logger.info(f"Setting webhook to: {webhook_url}")
             try:
                 # Видаляємо старий webhook
                 await bot.delete_webhook(drop_pending_updates=True)
@@ -159,20 +221,29 @@ async def setup_bot():
                     allowed_updates=["message", "callback_query", "inline_query"],
                     max_connections=100
                 )
-                logger.info(f"Webhook set to {webhook_url}")
+                logger.info(f"Webhook set successfully")
             except Exception as e:
                 logger.error(f"Failed to set webhook: {e}")
+                logger.error(traceback.format_exc())
                 return False
         else:
             # Видаляємо webhook для polling режиму
-            await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("Webhook removed, using polling mode")
+            logger.info("Removing webhook for polling mode...")
+            try:
+                await bot.delete_webhook(drop_pending_updates=True)
+                logger.info("Webhook removed, using polling mode")
+            except Exception as e:
+                logger.error(f"Error removing webhook: {e}")
+                logger.error(traceback.format_exc())
+                # Продовжуємо навіть якщо не вдалося видалити webhook
 
         logger.info("Bot setup completed successfully")
+        logger.info("=" * 50)
         return True
 
     except Exception as e:
-        logger.error(f"Error setting up bot: {e}")
+        logger.error(f"Error in setup_bot: {e}")
+        logger.error(traceback.format_exc())
         return False
 
 
@@ -311,5 +382,5 @@ __all__ = [
     'get_bot', 'get_dispatcher', 'get_storage',
     'setup_bot', 'shutdown_bot', 'create_webhook_app',
     'is_bot_initialized', 'is_dispatcher_initialized',
-    'get_bot_sync', 'get_dp_sync', 'get_storage_sync'  # ВИПРАВЛЕНО: замість properties
+    'get_bot_sync', 'get_dp_sync', 'get_storage_sync'
 ]
