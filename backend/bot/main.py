@@ -4,6 +4,8 @@
 import asyncio
 from typing import Optional
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
 from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
@@ -82,9 +84,12 @@ async def get_bot() -> Bot:
                     raise ValueError("TELEGRAM_BOT_TOKEN is required")
 
                 logger.info("Creating bot instance...")
+                # Використовуємо новий спосіб для aiogram 3.13+
                 _bot_instance = Bot(
                     token=config.TELEGRAM_BOT_TOKEN,
-                    parse_mode="HTML"
+                    default=DefaultBotProperties(
+                        parse_mode=ParseMode.HTML
+                    )
                 )
                 logger.info("Bot instance created")
 
@@ -203,6 +208,10 @@ async def setup_bot():
             logger.info("Creating bot instance...")
             bot = await get_bot()
             logger.info("✓ Bot instance created")
+
+            # Тестуємо що бот працює
+            me = await bot.get_me()
+            logger.info(f"✓ Bot verified: @{me.username} ({me.first_name})")
         except Exception as e:
             logger.error(f"✗ Bot creation failed: {e}")
             return False
