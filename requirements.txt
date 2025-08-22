@@ -1,16 +1,13 @@
-﻿# Core
+﻿
+# Core
 Flask==2.3.3
 gunicorn==21.2.0
 
 # Telegram Bot
 aiogram==3.13.1
 
-# Database
+# Database - без вказання версій підпакетів
 supabase==2.7.4
-postgrest==0.16.11
-gotrue==2.7.0
-realtime==2.0.5
-storage3==0.8.0
 
 # HTTP
 aiohttp==3.9.5
@@ -22,6 +19,8 @@ python-dotenv==1.0.1
 # Utils
 structlog==24.1.0
 pydantic==2.6.1
-
-# JSON
 ujson==5.9.0
+
+# DB
+psycopg2-binary==2.9.9
+redis==5.0.1
