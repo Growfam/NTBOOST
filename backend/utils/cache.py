@@ -1,62 +1,100 @@
 """
-Simple in-memory cache for Railway
+Redis cache for Railway
 """
 import json
+import os
 from typing import Any, Optional
-from datetime import datetime, timedelta
+import redis
+import logging
 
-class SimpleCache:
-    """In-memory cache"""
-    
+logger = logging.getLogger(__name__)
+
+class RedisCache:
+    """Redis cache wrapper"""
+
     def __init__(self):
-        self._storage = {}
-        self._expiry = {}
-    
+        self._client = None
+        self._connected = False
+
+    def _get_client(self):
+        """Get Redis client with lazy connection"""
+        if self._client is None:
+            redis_url = os.getenv('REDIS_URL', 'redis://localhost:6379')
+
+            if redis_url and redis_url != 'redis://localhost:6379':
+                try:
+                    self._client = redis.from_url(
+                        redis_url,
+                        decode_responses=True,
+                        socket_connect_timeout=5,
+                        retry_on_timeout=True,
+                        retry_on_error=[redis.ConnectionError, redis.TimeoutError]
+                    )
+                    # Test connection
+                    self._client.ping()
+                    self._connected = True
+                    logger.info("Redis cache connected")
+                except Exception as e:
+                    logger.warning(f"Redis cache connection failed: {e}")
+                    self._connected = False
+            else:
+                self._connected = False
+
+        return self._client if self._connected else None
+
     def set(self, key: str, value: Any, ttl: int = 300) -> bool:
         """Store value with TTL"""
         try:
-            self._storage[key] = json.dumps(value)
-            self._expiry[key] = datetime.now() + timedelta(seconds=ttl)
-            return True
-        except:
-            return False
-    
+            client = self._get_client()
+            if client:
+                client.setex(key, ttl, json.dumps(value))
+                return True
+        except Exception as e:
+            logger.error(f"Cache set error: {e}")
+        return False
+
     def get(self, key: str) -> Any:
-        """Get value if not expired"""
+        """Get value from cache"""
         try:
-            if key in self._expiry:
-                if datetime.now() < self._expiry[key]:
-                    return json.loads(self._storage[key])
-                else:
-                    # Expired, clean up
-                    del self._storage[key]
-                    del self._expiry[key]
-            return None
-        except:
-            return None
-    
+            client = self._get_client()
+            if client:
+                value = client.get(key)
+                if value:
+                    return json.loads(value)
+        except Exception as e:
+            logger.error(f"Cache get error: {e}")
+        return None
+
     def delete(self, key: str) -> bool:
         """Delete key"""
         try:
-            if key in self._storage:
-                del self._storage[key]
-            if key in self._expiry:
-                del self._expiry[key]
-            return True
-        except:
-            return False
-    
+            client = self._get_client()
+            if client:
+                client.delete(key)
+                return True
+        except Exception as e:
+            logger.error(f"Cache delete error: {e}")
+        return False
+
     def exists(self, key: str) -> bool:
-        """Check if key exists and not expired"""
-        return self.get(key) is not None
-    
+        """Check if key exists"""
+        try:
+            client = self._get_client()
+            if client:
+                return client.exists(key) > 0
+        except Exception:
+            pass
+        return False
+
     def connect(self):
+        """Initialize connection"""
+        self._get_client()
         return self
 
 # Global cache instance
-cache = SimpleCache()
+cache = RedisCache()
 
-# Helper functions - ДОДАНІ ФУНКЦІЇ!
+# Helper functions залишаються ті самі
 def cache_user_stats(telegram_id: str, stats: dict, ttl: int = 300):
     """Cache user statistics"""
     cache.set(f"user_stats:{telegram_id}", stats, ttl)
@@ -79,4 +117,9 @@ def invalidate_user_cache(telegram_id: str):
 
 def check_redis_health() -> bool:
     """Check cache health"""
-    return True  # Always healthy for in-memory
+    try:
+        cache.set('health_check', 'ok', 10)
+        result = cache.get('health_check')
+        return result == 'ok'
+    except:
+        return True  # Повертаємо True щоб не блокувати health check
