@@ -1,4 +1,20 @@
 # backend/utils/cache.py
+import os
+
+if os.getenv('FLASK_ENV') == 'development':
+    class DummyCache:
+        def set(self, *args, **kwargs): return True
+
+        def get(self, *args, **kwargs): return None
+
+        def delete(self, *args, **kwargs): return True
+
+        def exists(self, *args, **kwargs): return False
+
+        def connect(self): return self
+
+
+    cache = DummyCache()
 """
 Redis кешування для швидкодії
 """
