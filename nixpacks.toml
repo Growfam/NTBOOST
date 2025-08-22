@@ -1,11 +1,14 @@
-# Python 3.11 для Railway
 providers = ["python"]
 
 [phases.setup]
-nixPkgs = ["python311", "python311Packages.pip"]
+nixPkgs = ["python311", "python311Packages.pip", "python311Packages.setuptools"]
 
 [phases.install]
-cmds = ["pip install -r requirements.txt"]
+cmds = [
+    "python -m venv /opt/venv",
+    ". /opt/venv/bin/activate && pip install --upgrade pip",
+    ". /opt/venv/bin/activate && pip install -r requirements.txt"
+]
 
 [start]
-cmd = "python main.py"
+cmd = ". /opt/venv/bin/activate && python main.py"
